@@ -47,7 +47,7 @@ Install the required Python packages using the included `requirements.txt` file.
 
 ```bash
 # This single command installs everything needed for the plugin
-pip install -r .apex/plugins/MemoryPlus/requirements.txt
+pip install -r apex/plugins/MemoryPlus/requirements.txt
 ```
 
 ### 3. Set Up the Database (Choose One)
@@ -97,9 +97,9 @@ Once the application is running, configure the plugin from the UI:
 1.  Go to **Settings → Plugins → MemoryPlus (Graphiti)**.
 2.  **Critical Settings**:
     -   **Database Backend**: Choose `Neo4j` or `Kuzu`.
-    -   **Kuzu Path**: If using Kuzu, set the storage path. A good default is `~/.apex/memories/kuzu`.
-        -   **Windows**: `C:\Users\YourUser\.apex\memories\kuzu`
-        -   **macOS/Linux**: `~/.apex/memories/kuzu`
+    -   **Kuzu Path**: If using Kuzu, set the storage path. A good default is `~/apex/memories/kuzu`.
+        -   **Windows**: `C:\Users\YourUser\apex\memories\kuzu`
+        -   **macOS/Linux**: `~/apex/memories/kuzu`
     -   **Disable Default Vector Store**: ✅ Check this to prioritize Graphiti memory over PyGPT's standard RAG.
     -   **Link DB to Preset**: ✅ Check to keep memories separate for each of your presets.
 
