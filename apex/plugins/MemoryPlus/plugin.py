@@ -4,9 +4,11 @@ import os
 import sys
 import subprocess
 import threading
+import queue
+import time
 import re
 from datetime import datetime
-from typing import Optional, List
+from typing import Optional, List, Tuple
 
 from pygpt_net.plugin.base.plugin import BasePlugin
 from pygpt_net.core.events import Event
@@ -23,6 +25,9 @@ class Plugin(BasePlugin):
         self.prefix = "MemoryPlus"
         self.memory_buffer = None
         self.tabs = {}
+        self.ingest_queue: Optional[queue.Queue] = None
+        self.ingest_thread: Optional[threading.Thread] = None
+        self.ingest_stop_event: Optional[threading.Event] = None
         self.engine_client = None
         self.engine_restart_attempted = False
 
@@ -226,6 +231,26 @@ class Plugin(BasePlugin):
                         description="Number of memories to retrieve during search.",
                         min=1, max=100,
                         tab="advanced")
+        self.add_option("ingest_queue_size", "int", value=50,
+                        label="Ingestion Queue Size",
+                        description="Maximum number of pending ingestion items. 0 = unlimited.",
+                        min=0, max=1000,
+                        tab="advanced")
+        self.add_option("ingest_overflow_policy", "combo", value="drop_new",
+                        label="Ingestion Overflow Policy",
+                        description="When the ingestion queue is full: drop new item, drop oldest item, or block until space is free.",
+                        keys=["drop_new", "drop_oldest", "block"],
+                        tab="advanced")
+        self.add_option("ingest_batch_max_items", "int", value=5,
+                        label="Ingestion Batch Size",
+                        description="Maximum number of items to process together from the queue.",
+                        min=1, max=100,
+                        tab="advanced")
+        self.add_option("ingest_batch_max_delay_ms", "int", value=250,
+                        label="Ingestion Batch Delay (ms)",
+                        description="Maximum time to wait for additional items before processing a batch.",
+                        min=0, max=5000,
+                        tab="advanced")
 
 
     def init_tabs(self) -> dict:
@@ -246,11 +271,13 @@ class Plugin(BasePlugin):
         self.tabs = self.init_tabs()
         self.init_options()
         self._init_engine()
-        self.log("Plugin attached. Ready for Graphiti operations.")
+        self._start_ingest_worker()
+        self.log("Plugin attached. Ready for operations.")
 
     def detach(self, *args, **kwargs):
+        self._stop_ingest_worker()
         self._shutdown_engine()
-        return super().detach(*args, **kwargs)
+        super(Plugin, self).detach(*args, **kwargs)
 
     def handle(self, event: Event, *args, **kwargs):
         if event.name == Event.MODELS_CHANGED:
@@ -490,11 +517,96 @@ class Plugin(BasePlugin):
         ep_name = f"{title} - {datetime.now().strftime('%H:%M:%S')}"
 
         mode = self.get_option_value("memory_mode")
-        thread = threading.Thread(target=self._ingest_worker, args=(ep_name, episode_body, mode))
-        thread.daemon = True
-        thread.start()
+        self._enqueue_ingest_request(ep_name, episode_body, mode)
 
-    def _ingest_worker(self, name, content, mode):
+    def _start_ingest_worker(self):
+        if self.ingest_thread and self.ingest_thread.is_alive():
+            return
+
+        maxsize = self.get_option_value("ingest_queue_size") or 0
+        self.ingest_queue = queue.Queue(maxsize=maxsize)
+        self.ingest_stop_event = threading.Event()
+        self.ingest_thread = threading.Thread(target=self._ingest_loop, daemon=True)
+        self.ingest_thread.start()
+
+    def _stop_ingest_worker(self):
+        if self.ingest_stop_event:
+            self.ingest_stop_event.set()
+        if self.ingest_thread and self.ingest_thread.is_alive():
+            self.ingest_thread.join(timeout=2)
+        if self.ingest_queue:
+            try:
+                while True:
+                    dropped = self.ingest_queue.get_nowait()
+                    self.log(f"[WARN] Ingest worker stopped. Dropping pending item: {dropped[0]}")
+                    self.ingest_queue.task_done()
+            except queue.Empty:
+                pass
+        self.ingest_thread = None
+        self.ingest_queue = None
+        self.ingest_stop_event = None
+
+    def _enqueue_ingest_request(self, name: str, content: str, mode: str):
+        if not self.ingest_queue:
+            self._start_ingest_worker()
+
+        overflow_policy = self.get_option_value("ingest_overflow_policy")
+        item = (name, content, mode)
+
+        if overflow_policy == "block":
+            while self.ingest_stop_event and not self.ingest_stop_event.is_set():
+                try:
+                    self.ingest_queue.put(item, timeout=0.5)
+                    return
+                except queue.Full:
+                    continue
+            self.log(f"[WARN] Ingest worker stopping. Dropping item: {name}")
+            return
+
+        try:
+            self.ingest_queue.put(item, block=False)
+        except queue.Full:
+            if overflow_policy == "drop_oldest":
+                try:
+                    dropped = self.ingest_queue.get_nowait()
+                    self.ingest_queue.task_done()
+                    self.log(f"[WARN] Ingest queue full. Dropping oldest item: {dropped[0]}")
+                except queue.Empty:
+                    pass
+                try:
+                    self.ingest_queue.put_nowait(item)
+                except queue.Full:
+                    self.log(f"[WARN] Ingest queue full. Dropping new item: {name}")
+            else:
+                self.log(f"[WARN] Ingest queue full. Dropping new item: {name}")
+
+    def _ingest_loop(self):
+        while self.ingest_stop_event and not self.ingest_stop_event.is_set():
+            try:
+                first_item: Tuple[str, str, str] = self.ingest_queue.get(timeout=0.5)  # type: ignore
+            except queue.Empty:
+                continue
+
+            batch = [first_item]
+            max_items = max(1, int(self.get_option_value("ingest_batch_max_items") or 1))
+            max_delay = max(0, int(self.get_option_value("ingest_batch_max_delay_ms") or 0)) / 1000
+            start = time.monotonic()
+
+            while len(batch) < max_items:
+                remaining = max_delay - (time.monotonic() - start)
+                if remaining <= 0:
+                    break
+                try:
+                    next_item = self.ingest_queue.get(timeout=remaining)
+                    batch.append(next_item)
+                except queue.Empty:
+                    break
+
+            for name, content, mode in batch:
+                self._process_ingest(name, content, mode)
+                self.ingest_queue.task_done()
+
+    def _process_ingest(self, name: str, content: str, mode: str):
         response = self._engine_request(
             "INGEST",
             {"name": name, "content": content, "mode": mode},
