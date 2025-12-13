@@ -148,6 +148,7 @@ def evaluate_ingestion_controls(
 
     settings = config.get("ingestion_controls", {})
     now = now or datetime.utcnow()
+    pending_saves: List[tuple[str, List[Any]]] = []
 
     # Minimum size checks
     min_chars = settings.get("min_chars")
@@ -177,7 +178,7 @@ def evaluate_ingestion_controls(
         if len(timestamps) >= max_ingestions:
             return "Ingestion rate limit exceeded"
         timestamps.append(now)
-        saver(cache_path, [t.isoformat() for t in timestamps])
+        pending_saves.append((cache_path, [t.isoformat() for t in timestamps]))
 
     # Deduplication window
     dedup_minutes = settings.get("deduplication_window_minutes")
@@ -198,7 +199,10 @@ def evaluate_ingestion_controls(
         if seen_recently:
             return "Duplicate content within deduplication window"
         entries.append({"digest": digest, "timestamp": now.isoformat()})
-        saver(cache_path, entries)
+        pending_saves.append((cache_path, entries))
+
+    for cache_path, payload in pending_saves:
+        saver(cache_path, payload)
 
     return None
 

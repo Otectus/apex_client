@@ -133,6 +133,34 @@ class IngestionControlTests(unittest.TestCase):
             self.assertIsNone(first)
             self.assertEqual(duplicate, "Duplicate content within deduplication window")
 
+    def test_pending_saves_not_written_when_guardrail_fails(self):
+        digest = "4356f4252f6d90ead88cb6e0e47f76b0e03fddb883c97458d08be77a2d751b82"  # sha256("dupe")
+        cache_calls = []
+
+        def loader(path: str):
+            if path.endswith("rate.json"):
+                return []
+            if path.endswith("dedup.json"):
+                return [{"digest": digest, "timestamp": "2024-01-01T12:00:00"}]
+            return []
+
+        def saver(path: str, payload):
+            cache_calls.append((path, payload))
+
+        config = {
+            "ingestion_controls": {
+                "max_ingestions_per_minute": 5,
+                "rate_limit_cache": "rate.json",
+                "deduplication_window_minutes": 10,
+                "dedup_cache": "dedup.json",
+            }
+        }
+
+        reason = evaluate_ingestion_controls("dupe", config, now=datetime(2024, 1, 1, 12, 5, 0), loader=loader, saver=saver)
+
+        self.assertEqual(reason, "Duplicate content within deduplication window")
+        self.assertEqual(cache_calls, [])
+
 
 if __name__ == "__main__":
     unittest.main()
