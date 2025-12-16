@@ -26,6 +26,7 @@ class MemoryWorker(Process):
         self.response_queue = response_queue
         self.client = None
         self.driver_type = ""
+        self.graph_driver = None
 
     def _send_response(self, resp: EngineResponse):
         try:
@@ -65,8 +66,8 @@ class MemoryWorker(Process):
         custom_llm = runner_module.OpenAIGenericClient(llm_config)
 
         embed_conf = self.config.get("embedding", {})
-        embed_model = embed_conf.get("model", "text-embedding-3-small")
-        embed_provider = embed_conf.get("provider", "OpenAI")
+        embed_model = embed_conf.get("model", "mxbai-embed-large:latest")
+        embed_provider = embed_conf.get("provider", "Ollama")
         embedder = None
         if embed_provider == "Google":
             if runner_module.GeminiEmbedder:
@@ -79,6 +80,8 @@ class MemoryWorker(Process):
             else:
                 raise RuntimeError("Google GenAI library missing.")
         elif embed_provider == "Ollama":
+            if embed_model == "mxbai-embed-large":
+                embed_model = "mxbai-embed-large:latest" # ENFORCE :latest
             embedder = runner_module.OpenAIEmbedder(
                 runner_module.OpenAIEmbedderConfig(
                     embedding_model=embed_model,
@@ -92,6 +95,7 @@ class MemoryWorker(Process):
         client_kwargs = {"llm_client": custom_llm, "embedder": embedder}
         if graph_driver:
             client_kwargs["graph_driver"] = graph_driver
+            self.graph_driver = graph_driver
         else:
             client_kwargs.update({
                 "uri": self.config["uri"],
@@ -170,10 +174,70 @@ class MemoryWorker(Process):
         return EngineResponse(payload.get("request_id", ""), "success", data={"results": output})
 
     def _handle_forget(self, payload: Dict[str, Any]) -> EngineResponse:
-        # Placeholder for future graph deletion support
-        return EngineResponse(payload.get("request_id", ""), "skipped", data={
-            "message": "Forget operation is not implemented."
+        query_text = (payload.get("query") or "").strip()
+        expiration_threshold = payload.get("expiration_threshold")
+        if not query_text and not expiration_threshold:
+            return EngineResponse(payload.get("request_id", ""), "skipped", data={
+                "message": "No forget criteria supplied."
+            })
+
+        try:
+            if self.driver_type == "Neo4j":
+                deleted = self._forget_neo4j(query_text, expiration_threshold)
+            elif self.driver_type == "Kuzu":
+                deleted = self._forget_kuzu(query_text, expiration_threshold)
+            else:
+                deleted = 0
+        except Exception as exc:
+            return EngineResponse(payload.get("request_id", ""), "error", error=str(exc))
+
+        message = f"Removed {deleted} memories."
+        if self.driver_type == "Kuzu":
+            message = "Kuzu forget support is limited; no memories were removed."
+
+        return EngineResponse(payload.get("request_id", ""), "success", data={
+            "deleted": deleted,
+            "message": message,
         })
+
+    def _forget_neo4j(self, query_text: str, expiration_threshold: Optional[str]) -> int:
+        from apex.plugins.MemoryPlus import runner as runner_module
+
+        uri = self.config.get("uri")
+        user = self.config.get("user")
+        password = self.config.get("password")
+        if not uri or not user or not password:
+            raise RuntimeError("Neo4j credentials are not configured.")
+
+        driver = runner_module.neo4j.GraphDatabase.driver(uri, auth=(user, password))
+        needle = query_text.lower() if query_text else None
+        params = {
+            "group_id": self.group_id,
+            "needle": needle,
+            "expiration": expiration_threshold,
+        }
+        cypher = (
+            "MATCH (e:Episode) "
+            "WHERE e.group_id = $group_id "
+            "AND ($needle IS NULL OR toLower(coalesce(e.fact,'')) CONTAINS $needle "
+            "     OR toLower(coalesce(e.body,'')) CONTAINS $needle "
+            "     OR toLower(coalesce(e.summary,'')) CONTAINS $needle) "
+            "AND ($expiration IS NULL OR e.reference_time <= datetime($expiration)) "
+            "WITH e "
+            "DETACH DELETE e "
+            "RETURN count(e) AS removed"
+        )
+        try:
+            with driver.session(database=self.group_id or None) as session:
+                record = session.run(cypher, params).single()
+                return record["removed"] if record else 0
+        finally:
+            driver.close()
+
+    def _forget_kuzu(self, query_text: str, expiration_threshold: Optional[str]) -> int:
+        # Kuzu driver currently lacks a stable public API for targeted deletes via Graphiti.
+        # Until upstream support exists, we gracefully report that no rows were removed.
+        return 0
 
     def run(self):
         loop = asyncio.new_event_loop()

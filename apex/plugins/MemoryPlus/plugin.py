@@ -7,12 +7,76 @@ import threading
 import queue
 import time
 import re
-from datetime import datetime
-from typing import Optional, List, Tuple
+from collections import OrderedDict
+from datetime import datetime, timedelta
+from difflib import SequenceMatcher
+from typing import Optional, List, Tuple, Callable, Dict, Any
+from urllib.request import Request, urlopen
+from urllib.error import URLError, HTTPError
 
 from pygpt_net.plugin.base.plugin import BasePlugin
 from pygpt_net.core.events import Event
 from .memory_engine.client import MemoryEngineClient, ENGINE_MODES
+from .memory_engine.protocol import REQUEST_SEARCH
+
+
+class SearchCache:
+    """Simple LRU cache with TTL for recent search results."""
+
+    def __init__(self):
+        self.max_entries = 0
+        self.ttl = 0.0
+        self.fuzzy_ratio = 1.0
+        self._cache: "OrderedDict[str, tuple[float, List[str]]]" = OrderedDict()
+
+    def configure(self, max_entries: int, ttl_seconds: float, fuzzy_ratio: float):
+        self.max_entries = max(0, int(max_entries))
+        self.ttl = max(0.0, float(ttl_seconds))
+        self.fuzzy_ratio = min(1.0, max(0.0, float(fuzzy_ratio)))
+        if self.max_entries == 0 or self.ttl == 0:
+            self.clear()
+
+    def _normalize(self, query: str) -> str:
+        return re.sub(r"\s+", " ", query or "").strip().lower()
+
+    def _prune(self):
+        if self.max_entries == 0 or self.ttl == 0:
+            self._cache.clear()
+            return
+        now = time.time()
+        expired = [key for key, (ts, _) in self._cache.items() if now - ts > self.ttl]
+        for key in expired:
+            self._cache.pop(key, None)
+        while len(self._cache) > self.max_entries:
+            self._cache.popitem(last=False)
+
+    def get(self, query: str) -> Optional[List[str]]:
+        if self.max_entries == 0 or self.ttl == 0:
+            return None
+        normalized = self._normalize(query)
+        self._prune()
+        if normalized in self._cache:
+            ts, payload = self._cache.pop(normalized)
+            self._cache[normalized] = (ts, payload)
+            return payload
+        if self.fuzzy_ratio < 1.0:
+            for key in list(self._cache.keys()):
+                ratio = SequenceMatcher(None, normalized, key).ratio()
+                if ratio >= self.fuzzy_ratio:
+                    ts, payload = self._cache.pop(key)
+                    self._cache[normalized] = (ts, payload)
+                    return payload
+        return None
+
+    def set(self, query: str, results: List[str]):
+        if self.max_entries == 0 or self.ttl == 0:
+            return
+        normalized = self._normalize(query)
+        self._cache[normalized] = (time.time(), list(results))
+        self._prune()
+
+    def clear(self):
+        self._cache.clear()
 
 class Plugin(BasePlugin):
     def __init__(self, *args, **kwargs):
@@ -30,9 +94,42 @@ class Plugin(BasePlugin):
         self.ingest_stop_event: Optional[threading.Event] = None
         self.engine_client = None
         self.engine_restart_attempted = False
+        self.search_cache = SearchCache()
+        self._cache_config_signature = None
+        self._cache_group_id = None
+        self._engine_warmup_thread: Optional[threading.Thread] = None
+        self._engine_warmup_lock = threading.Lock()
+        self._engine_ready = threading.Event()
+        self._options_ready = False
+        self._expiry_timer = None  # Track expiry timer
+        self._response_poller: Optional[threading.Thread] = None
+        self._response_poller_stop: Optional[threading.Event] = None
+        self._engine_callbacks: Dict[str, Callable[[Optional[Dict[str, Any]]], None]] = {}
+        self._callback_lock = threading.Lock()
+        self._callback_results: "queue.Queue[Tuple[str, Optional[Dict[str, Any]]]]" = queue.Queue()
+
+    def log_safe_command(self, cmd: list) -> str:
+        # Replace any sensitive fields in JSON config with [REDACTED]
+        sanitized_cmd = []
+        for part in cmd:
+            if part.startswith("--config"): 
+                # Extract and redact JSON key values for 'db_pass', 'override_api_key', etc.
+                config_json = part[10:]  # "--config" is 10 chars
+                try:
+                    config = json.loads(config_json)
+                    redacted = config.copy()
+                    redacted["db_pass"] = "[REDACTED]"
+                    redacted["override_api_key"] = "[REDACTED]"
+                    part = f"--config {json.dumps(redacted)}"
+                except: pass
+            sanitized_cmd.append(part)
+        return " ".join(sanitized_cmd)
 
     def init_options(self):
         """Initialize options and tabs"""
+        if self._options_ready:
+            return
+        self._options_ready = True
         # General
         self.add_option("auto_ingest", "bool", value=True,
                         label="Auto-Ingest",
@@ -101,7 +198,10 @@ class Plugin(BasePlugin):
                         value="Chatbot",
                         label="Memory Mode",
                         description="Select the active memory analysis mode. This determines the lens through which conversations are analyzed for insights.",
-                        keys=["Identity", "Assistant", "Chatbot", "Productivity", "Research", "Discourse"],
+                        keys=[
+                            "Identity", "Assistant", "Chatbot", "Productivity",
+                            "Research", "Discourse", "ResolveEntities", "MemoryGate", "CustomPrompt"
+                        ],
                         tab="models")
         self.add_option("insight_model", "combo", value="gpt-4o",
                         label="Insight Model",
@@ -224,12 +324,31 @@ class Plugin(BasePlugin):
                         tab="advanced")
         self.add_option("enable_memory_feedback", "bool", value=True,
                         label="Enable Memory Feedback",
-                        description="Let the user rate memories via 👍/👎.",
+                        description="Let the user rate memories via \ud83d\udc4d/\ud83d\udc4e.",
                         tab="advanced")
         self.add_option("memory_search_depth", "int", value=10,
                         label="Memory Search Depth",
                         description="Number of memories to retrieve during search.",
                         min=1, max=100,
+                        tab="advanced")
+        self.add_option("enable_search_cache", "bool", value=True,
+                        label="Enable Search Cache",
+                        description="Cache the most recent memory searches to avoid redundant Graphiti calls.",
+                        tab="advanced")
+        self.add_option("search_cache_size", "int", value=8,
+                        label="Search Cache Size",
+                        description="Maximum number of cached searches to keep.",
+                        min=0, max=100,
+                        tab="advanced")
+        self.add_option("search_cache_ttl_seconds", "int", value=45,
+                        label="Search Cache TTL (s)",
+                        description="Seconds a cached search result remains valid.",
+                        min=0, max=600,
+                        tab="advanced")
+        self.add_option("search_cache_similarity", "float", value=0.85,
+                        label="Search Cache Similarity",
+                        description="Similarity ratio (0-1) required to treat two queries as the same for caching.",
+                        min=0.0, max=1.0, step=0.05,
                         tab="advanced")
         self.add_option("ingest_queue_size", "int", value=50,
                         label="Ingestion Queue Size",
@@ -251,6 +370,25 @@ class Plugin(BasePlugin):
                         description="Maximum time to wait for additional items before processing a batch.",
                         min=0, max=5000,
                         tab="advanced")
+        self.add_option("ingest_retry_attempts", "int", value=3,
+                        label="Ingestion Retry Attempts",
+                        description="Number of times to retry a failed ingestion before giving up.",
+                        min=1, max=10,
+                        tab="advanced")
+        self.add_option("ingest_retry_backoff_ms", "int", value=500,
+                        label="Ingestion Retry Backoff (ms)",
+                        description="Initial delay before retrying ingestion. Doubles with each retry.",
+                        min=100, max=5000,
+                        tab="advanced")
+        self.add_option("runner_timeout_seconds", "int", value=45,
+                        label="Runner Timeout (s)",
+                        description="Timeout for per-call Graphiti subprocess operations.",
+                        min=5, max=180,
+                        tab="advanced")
+        self.add_option("custom_memory_prompt", "text", value="",
+                        label="Custom Analysis Prompt",
+                        description="Optional custom prompt used only when Memory Mode is set to CustomPrompt.",
+                        tab="advanced")
 
 
     def init_tabs(self) -> dict:
@@ -266,9 +404,9 @@ class Plugin(BasePlugin):
         return tabs
 
     def attach(self, window):
+        self.tabs = self.init_tabs()
         super(Plugin, self).attach(window)
         self.window = window
-        self.tabs = self.init_tabs()
         self.init_options()
         self._init_engine()
         self._start_ingest_worker()
@@ -276,10 +414,12 @@ class Plugin(BasePlugin):
 
     def detach(self, *args, **kwargs):
         self._stop_ingest_worker()
+        self._stop_expiry_monitoring()
         self._shutdown_engine()
         super(Plugin, self).detach(*args, **kwargs)
 
     def handle(self, event: Event, *args, **kwargs):
+        self._flush_engine_callbacks()
         if event.name == Event.MODELS_CHANGED:
             self.refresh_option("llm_model")
             self.refresh_option("insight_model")
@@ -319,6 +459,7 @@ class Plugin(BasePlugin):
         main_model_config = self._get_model_config("llm_model")
         insight_model_config = self._get_model_config("insight_model")
         google_key = self.window.core.config.get("api_key_google") or ""
+        embedding_settings = self._resolve_embedding_settings(google_key)
 
         return {
             # DB
@@ -343,11 +484,7 @@ class Plugin(BasePlugin):
                 "api_key": insight_model_config["api_key"],
             },
             # Embedding
-            "embedding": {
-                "provider": self.get_option_value("embedding_provider"),
-                "model": self.get_option_value("embedding_model"),
-                "google_api_key": google_key
-            },
+            "embedding": embedding_settings,
             # New config options
             "sanitization": {
                 "sanitize_tool_calls": self.get_option_value("sanitize_tool_calls"),
@@ -374,8 +511,236 @@ class Plugin(BasePlugin):
                 "memory_review_interval": self.get_option_value("memory_review_interval"),
                 "enable_memory_feedback": self.get_option_value("enable_memory_feedback"),
                 "memory_search_depth": self.get_option_value("memory_search_depth"),
+                "custom_analysis_prompt": self.get_option_value("custom_memory_prompt"),
             }
         }
+
+    def _resolve_embedding_settings(self, google_key: str):
+        provider = self.get_option_value("embedding_provider")
+        model = self.get_option_value("embedding_model")
+        settings = {
+            "provider": provider,
+            "model": model,
+            "google_api_key": google_key,
+        }
+
+        if provider == "Ollama":
+            if model == "mxbai-embed-large":
+                model = "mxbai-embed-large:latest" # ENFORCE :latest
+            base_url = os.environ.get("OLLAMA_API_BASE") or "http://localhost:11434"
+            if not self._ollama_model_available(base_url, model):
+                fallback_model = "mxbai-embed-large:latest" # Fallback with :latest
+                settings.update({
+                    "provider": "OpenAI",
+                    "model": fallback_model,
+                })
+                self.log(
+                    f"[WARN] Ollama embedding model {model} not available at {base_url}. "
+                    f"Falling back to OpenAI {fallback_model}."
+                )
+        elif provider == "Google":
+            if not google_key:
+                self.error("Google embedding provider selected but no Google API key found. Falling back to OpenAI.")
+                settings.update({
+                    "provider": "OpenAI",
+                    "model": "mxbai-embed-large:latest", # Fallback with :latest
+                })
+        return settings
+
+    def _ollama_model_available(self, base_url: str, model: str) -> bool:
+        url = base_url.rstrip("/")
+        if url.endswith("/v1"):
+            url = url[:-3]
+        tags_endpoint = f"{url}/api/tags"
+        try:
+            req = Request(tags_endpoint, method="GET")
+            with urlopen(req, timeout=2) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+        except (URLError, HTTPError, ValueError, json.JSONDecodeError):
+            return False
+        if isinstance(data, dict):
+            items = data.get("models") or data.get("data") or []
+        else:
+            items = data
+        for item in items or []:
+            name = item.get("name") or item.get("model")
+            if name == model:
+                return True
+        return False
+
+    def _get_runner_timeout(self) -> int:
+        try:
+            return max(5, int(self.get_option_value("runner_timeout_seconds")))
+        except Exception:
+            return 45
+
+    def _kickoff_engine_warmup(self, restart: bool = False):
+        if not self._should_use_persistent():
+            return
+
+        def target():
+            self._start_engine_worker(restart=restart)
+
+        with self._engine_warmup_lock:
+            if self._engine_warmup_thread and self._engine_warmup_thread.is_alive():
+                if not restart:
+                    return
+            self._engine_warmup_thread = threading.Thread(target=target, daemon=True)
+            self._engine_warmup_thread.start()
+
+    def _start_response_poller(self):
+        if not self._should_use_persistent():
+            return
+        if self._response_poller and self._response_poller.is_alive():
+            return
+
+        self._response_poller_stop = threading.Event()
+
+        def _poll():
+            while self._response_poller_stop and not self._response_poller_stop.is_set():
+                try:
+                    client = self._ensure_engine_client()
+                    if not client or not client.is_alive():
+                        time.sleep(0.5)
+                        continue
+                    resp = client.poll_response(timeout=0.5)
+                    if not resp:
+                        continue
+                    req_id = resp.get("request_id")
+                    with self._callback_lock:
+                        has_callback = req_id in self._engine_callbacks
+                    if has_callback:
+                        self._queue_callback_response(req_id, resp)
+                except Exception:
+                    time.sleep(0.5)
+
+        self._response_poller = threading.Thread(target=_poll, daemon=True)
+        self._response_poller.start()
+
+    def _stop_response_poller(self):
+        if self._response_poller_stop:
+            self._response_poller_stop.set()
+        if self._response_poller and self._response_poller.is_alive():
+            self._response_poller.join(timeout=2)
+        self._response_poller = None
+        self._response_poller_stop = None
+        with self._callback_lock:
+            self._engine_callbacks.clear()
+        while not self._callback_results.empty():
+            try:
+                self._callback_results.get_nowait()
+            except queue.Empty:
+                break
+
+    def _register_engine_callback(self, request_id: str, callback: Callable[[Optional[Dict[str, Any]]], None]):
+        if not request_id or not callback:
+            return
+        with self._callback_lock:
+            self._engine_callbacks[request_id] = callback
+    
+    def _queue_callback_response(self, request_id: str, response: Optional[Dict[str, Any]]):
+        try:
+            self._callback_results.put_nowait((request_id, response))
+        except queue.Full:
+            self.error("[MemoryPlus] Callback queue is full; dropping response.")
+
+    def _flush_engine_callbacks(self):
+        while True:
+            try:
+                request_id, response = self._callback_results.get_nowait()
+            except queue.Empty:
+                break
+            callback = None
+            with self._callback_lock:
+                callback = self._engine_callbacks.pop(request_id, None)
+            if callback:
+                try:
+                    callback(response)
+                except Exception as exc:
+                    self.error(f"[MemoryPlus] Callback execution error: {exc}")
+
+    def _start_engine_worker(self, restart: bool = False):
+        client = self._ensure_engine_client()
+        if not client:
+            self._engine_ready.clear()
+            return
+
+        if restart:
+            self._engine_ready.clear()
+            ok = client.restart()
+        else:
+            if client.is_alive():
+                if not self._engine_ready.is_set():
+                    if self._wait_for_engine_health(client):
+                        self._engine_ready.set()
+                return
+            ok = client.start()
+
+        if ok and self._wait_for_engine_health(client):
+            self._engine_ready.set()
+            self.log("Persistent Graphiti worker ready.")
+        else:
+            self._engine_ready.clear()
+            self.error("Failed to start persistent Graphiti worker. Falling back to subprocess mode.")
+
+    def _wait_for_engine_health(self, client, timeout: float = 15.0) -> bool:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                resp = client.health()
+                if resp and resp.get("status") == "success":
+                    return True
+            except Exception:
+                pass
+            time.sleep(0.5)
+        return False
+
+    def _configure_cache(self) -> bool:
+        group_id = self._get_group_id()
+        enable = bool(self.get_option_value("enable_search_cache"))
+        size = int(self.get_option_value("search_cache_size") or 0)
+        ttl = int(self.get_option_value("search_cache_ttl_seconds") or 0)
+        similarity = float(self.get_option_value("search_cache_similarity") or 0)
+        signature = (group_id, enable, size, ttl, similarity)
+
+        if signature == self._cache_config_signature:
+            return enable and size > 0 and ttl > 0
+
+        if not enable or size <= 0 or ttl <= 0:
+            self.search_cache.clear()
+            self._cache_config_signature = signature
+            self._cache_group_id = group_id
+            return False
+
+        if self._cache_group_id != group_id:
+            self.search_cache.clear()
+            self._cache_group_id = group_id
+
+        self.search_cache.configure(size, ttl, similarity or 1.0)
+        self._cache_config_signature = signature
+        return True
+
+    def _cache_key(self, query: str, limit: int) -> str:
+        group_id = self._cache_group_id or self._get_group_id()
+        return f"{group_id}::{limit}::{query}"
+
+    def _invalidate_cache(self):
+        self.search_cache.clear()
+        self._cache_config_signature = None
+        self._cache_group_id = None
+
+    def _extract_results(self, response) -> List[str]:
+        if not response:
+            return []
+        results = response.get("results")
+        if isinstance(results, list):
+            return results
+        data = response.get("data")
+        if isinstance(data, dict):
+            nested = data.get("results")
+            if isinstance(nested, list):
+                return nested
+        return []
 
     def _get_runner_cmd(self, operation: str, **kwargs):
         runner_path = os.path.join(os.path.dirname(__file__), "runner.py")
@@ -390,9 +755,10 @@ class Plugin(BasePlugin):
         return cmd
 
     def _run_subprocess(self, cmd, background=False):
-        self.log(f"Executing: {' '.join(cmd)}")
+        self.log(f"Executing: {self.log_safe_command(cmd)}")
+        timeout = self._get_runner_timeout()
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
             response = None
             if result.stdout.strip():
                 try:
@@ -405,19 +771,24 @@ class Plugin(BasePlugin):
                 self.log(f"[ERROR] {msg}") if background else self.error(msg)
                 return None
             return response
+        except subprocess.TimeoutExpired:
+            msg = f"Subprocess timed out after {timeout}s: {self.log_safe_command(cmd)}"
+            self.log(f"[ERROR] {msg}") if background else self.error(msg)
+            return None
         except Exception as e:
             msg = f"Subprocess error: {e}"
             self.log(f"[ERROR] {msg}") if background else self.error(msg)
             return None
 
     def _init_engine(self):
-        if self.get_option_value("engine_mode") not in ["persistent", "auto"]:
+        if not self._should_use_persistent():
+            self._engine_ready.clear()
+            self._stop_response_poller()
             return
         self.engine_restart_attempted = False
-        self._ensure_engine_client()
-        client = self.engine_client
-        if client and not client.start():
-            self.error("Failed to start persistent Graphiti worker. Falling back to subprocess mode.")
+        self._start_response_poller()
+        self._kickoff_engine_warmup()
+        self._start_expiry_monitoring()  # Start memory expiry monitoring
 
     def _ensure_engine_client(self):
         if not self.engine_client:
@@ -427,11 +798,17 @@ class Plugin(BasePlugin):
                 logger=self.log,
                 error_logger=self.error
             )
+            self.engine_client.enable_external_polling()
             atexit.register(self._shutdown_engine)
         return self.engine_client
 
     def _should_use_persistent(self):
-        return self.get_option_value("engine_mode") in ["persistent", "auto"]
+        mode = self.get_option_value("engine_mode")
+        if mode == "subprocess":
+            return False
+        if mode == "persistent":
+            return True
+        return True  # auto defaults to persistent
 
     def _restart_engine(self):
         if not self._should_use_persistent():
@@ -439,15 +816,25 @@ class Plugin(BasePlugin):
         if self.engine_restart_attempted:
             return False
         self.engine_restart_attempted = True
-        client = self._ensure_engine_client()
         self.log("Restarting persistent Graphiti worker after failure.")
-        return client.restart()
+        self._kickoff_engine_warmup(restart=True)
+        return self._engine_ready.wait(timeout=15.0)
 
     def _engine_request(self, request_type: str, payload: dict, fallback_fn):
         if not self._should_use_persistent():
             return fallback_fn()
 
+        self._kickoff_engine_warmup()
+        self._start_response_poller()
+        if not self._engine_ready.wait(timeout=15.0):
+            self.log("Persistent Graphiti worker still warming up. Using subprocess fallback.")
+            return fallback_fn()
+
         client = self._ensure_engine_client()
+        if not client or not client.is_alive():
+            self._engine_ready.clear()
+            return fallback_fn()
+
         method = {
             "SEARCH": client.search,
             "INGEST": client.ingest,
@@ -464,25 +851,68 @@ class Plugin(BasePlugin):
                 response = method(**payload)
 
         if not response or response.get("status") == "error":
+            self._engine_ready.clear()
             return fallback_fn()
         return response
 
+    def _submit_async_engine_request(
+        self,
+        operation: str,
+        payload: dict,
+        callback: Callable[[Optional[Dict[str, Any]]], None],
+        fallback_fn,
+    ) -> bool:
+        if not self._should_use_persistent():
+            response = fallback_fn()
+            callback(response)
+            return False
+
+        self._kickoff_engine_warmup()
+        self._start_response_poller()
+        if not self._engine_ready.wait(timeout=15.0):
+            response = fallback_fn()
+            callback(response)
+            return False
+
+        client = self._ensure_engine_client()
+        if not client or not client.is_alive():
+            response = fallback_fn()
+            callback(response)
+            return False
+
+        request_id = client.submit_async(operation, payload)
+        if not request_id:
+            response = fallback_fn()
+            callback(response)
+            return False
+
+        self._register_engine_callback(request_id, callback)
+        return True
+
     def _shutdown_engine(self):
+        self._stop_response_poller()
         if self.engine_client:
             try:
                 self.engine_client.shutdown()
             except Exception:
                 pass
+        self._engine_ready.clear()
+        self._engine_warmup_thread = None
 
     def _on_ctx_before(self, event: Event):
         if not self.get_option_value("inject_context"): return
         ctx = event.ctx
         if not ctx.input: return
 
-        response = self._search_memories(ctx.input, self.get_option_value("search_depth"))
+        limit = self.get_option_value("search_depth")
+        if self._should_use_persistent():
+            handled = self._search_memories_async(ctx.input, limit)
+            if handled:
+                return
 
+        response = self._search_memories(ctx.input, limit)
         if response and response.get("status") == "success":
-            results = response.get("results", [])
+            results = self._extract_results(response)
             if results:
                 self._format_memory_buffer(results)
         elif response:
@@ -607,19 +1037,119 @@ class Plugin(BasePlugin):
                 self.ingest_queue.task_done()
 
     def _process_ingest(self, name: str, content: str, mode: str):
-        response = self._engine_request(
-            "INGEST",
-            {"name": name, "content": content, "mode": mode},
-            lambda: self._run_subprocess(self._get_runner_cmd("add", name=name, content=content, mode=mode), background=True)
+        attempts = max(1, int(self.get_option_value("ingest_retry_attempts") or 1))
+        backoff = max(0.1, (int(self.get_option_value("ingest_retry_backoff_ms") or 100) / 1000))
+        last_response = None
+
+        for attempt in range(1, attempts + 1):
+            response = self._engine_request(
+                "INGEST",
+                {"name": name, "content": content, "mode": mode},
+                lambda: self._run_subprocess(
+                    self._get_runner_cmd("add", name=name, content=content, mode=mode),
+                    background=True,
+                ),
+            )
+            last_response = response
+            if response:
+                status = response.get("status")
+                if status == "success":
+                    self.log(f"Ingested: {name} [Mode: {mode}]")
+                    self._invalidate_cache()
+                    return
+                if status == "skipped":
+                    self.log(f"Ingest skipped: {response.get('data', {}).get('message', 'Lifecycle rule matched')}")
+                    return
+            if attempt < attempts:
+                time.sleep(backoff)
+                backoff *= 2
+
+        if last_response:
+            self.log(f"[ERROR] Ingest Error: {last_response.get('error') or last_response.get('data')}")
+        else:
+            self.log(f"[ERROR] Ingest Error: runner produced no response for {name}")
+
+    def _process_search_response(self, response: Optional[Dict[str, Any]], use_cache: bool, cache_key: Optional[str]):
+        if not response:
+            self.error("Search Error: Graphiti returned no response.")
+            return
+        if response.get("status") != "success":
+            self.error(f"Search Error: {response.get('error') or response.get('data')}")
+            return
+        results = self._extract_results(response)
+        if results:
+            if use_cache and cache_key and not response.get("cached"):
+                self.search_cache.set(cache_key, results)
+            self._format_memory_buffer(results)
+
+    def _search_memories_async(self, query: str, limit: int):
+        use_cache = self._configure_cache()
+        cache_key = self._cache_key(query, limit) if use_cache else None
+        if use_cache and cache_key:
+            cached = self.search_cache.get(cache_key)
+            if cached is not None:
+                self._process_search_response({"status": "success", "results": cached, "cached": True}, use_cache, cache_key)
+                return True
+
+        def callback(response: Optional[Dict[str, Any]]):
+            self._process_search_response(response, use_cache, cache_key)
+
+        fallback = lambda: self._run_subprocess(self._get_runner_cmd("search", query=query, limit=limit))
+        submitted = self._submit_async_engine_request(
+            REQUEST_SEARCH,
+            {"query": query, "limit": limit},
+            callback,
+            fallback,
         )
-        if response and response.get("status") == "success":
-            self.log(f"Ingested: {name} [Mode: {mode}]")
-        elif response:
-            self.log(f"[ERROR] Ingest Error: {response.get('error')}")
+        if not submitted:
+            return True
+        return True
 
     def _search_memories(self, query: str, limit: int):
-        return self._engine_request(
+        use_cache = self._configure_cache()
+        cache_key = None
+        if use_cache:
+            cache_key = self._cache_key(query, limit)
+            cached = self.search_cache.get(cache_key)
+            if cached is not None:
+                return {"status": "success", "results": cached, "cached": True}
+
+        response = self._engine_request(
             "SEARCH",
             {"query": query, "limit": limit},
-            lambda: self._run_subprocess(self._get_runner_cmd("search", query=query, limit=limit))
+            lambda: self._run_subprocess(self._get_runner_cmd("search", query=query, limit=limit)),
         )
+
+        if response and response.get("status") == "success" and use_cache and cache_key:
+            results = self._extract_results(response)
+            if results is not None:
+                self.search_cache.set(cache_key, results)
+        return response
+
+    # New memory expiry implementation
+    def _start_expiry_monitoring(self):
+        days = self.get_option_value("memory_expiry_days")
+        if days <= 0:
+            if self._expiry_timer is not None:
+                self._expiry_timer.cancel()
+                self._expiry_timer = None
+            return
+        cutoff = datetime.utcnow() - timedelta(days=days)
+        self._engine_request(
+            "FORGET",
+            {"expiration_threshold": cutoff.isoformat()},
+            fallback_fn=lambda: self._run_subprocess(
+                self._get_runner_cmd("delete_expired", days=days),
+                background=True
+            )
+        )
+        # Reschedule for daily check
+        if self._expiry_timer is not None:
+            self._expiry_timer.cancel()
+        self._expiry_timer = threading.Timer(86400, self._start_expiry_monitoring)
+        self._expiry_timer.start()
+
+    def _stop_expiry_monitoring(self):
+        if self._expiry_timer is not None:
+            self._expiry_timer.cancel()
+            self._expiry_timer = None
